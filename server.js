@@ -26,8 +26,7 @@ const io = new Server(server, {
         allowedHeaders: ['*'],
         credentials: true
     },
-    transports: ['polling', 'websocket'], // Prioriza polling sobre WebSockets
-    allowUpgrades: false, // Impede upgrade para WebSockets
+    transports: ['polling', 'websocket'],
     pingTimeout: 30000,
     pingInterval: 25000
 });
@@ -47,9 +46,13 @@ app.get('/api/health', (req, res) => {
 
 // Armazena as conexões ativas do WhatsApp
 const connections = {};
+// Armazena as mensagens recentes recebidas por sessão
+const recentMessages = {};
+// Armazena QR codes gerados
+const qrCodes = {};
 
 // Função para iniciar uma conexão com o WhatsApp
-async function startWhatsAppConnection(sessionId, socketId) {
+async function startWhatsAppConnection(sessionId, socketId = null) {
     const sessionFolder = path.join(AUTH_FOLDER, sessionId);
     
     // Cria pasta da sessão se não existir
@@ -79,15 +82,28 @@ async function startWhatsAppConnection(sessionId, socketId) {
         if (qr) {
             console.log('QR Code recebido, gerando imagem...');
             const qrCodeDataURL = await qrcode.toDataURL(qr);
-            io.to(socketId).emit('qr', { qrCode: qrCodeDataURL });
+            
+            // Armazena o QR code para requisições HTTP
+            qrCodes[sessionId] = qrCodeDataURL;
+            
+            // Também envia via Socket.io se disponível
+            if (socketId) {
+                io.to(socketId).emit('qr', { qrCode: qrCodeDataURL });
+            }
         }
 
         if (connection === 'open') {
             console.log('Conexão aberta!');
-            io.to(socketId).emit('connection-open', {
-                user: sock.user,
-                connected: true
-            });
+            
+            // Limpa QR code pois não é mais necessário
+            delete qrCodes[sessionId];
+            
+            if (socketId) {
+                io.to(socketId).emit('connection-open', {
+                    user: sock.user,
+                    connected: true
+                });
+            }
         }
 
         if (connection === 'close') {
@@ -95,12 +111,20 @@ async function startWhatsAppConnection(sessionId, socketId) {
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
             console.log('Conexão fechada. Código de status:', statusCode);
-            io.to(socketId).emit('connection-close', {
-                shouldReconnect,
-                statusCode
-            });
             
-            if (shouldReconnect) {
+            if (socketId) {
+                io.to(socketId).emit('connection-close', {
+                    shouldReconnect,
+                    statusCode
+                });
+            }
+            
+            // Se não for para reconectar, remova a conexão
+            if (!shouldReconnect) {
+                delete connections[sessionId];
+                delete qrCodes[sessionId];
+                delete recentMessages[sessionId];
+            } else {
                 console.log('Tentando reconectar...');
                 startWhatsAppConnection(sessionId, socketId);
             }
@@ -113,7 +137,29 @@ async function startWhatsAppConnection(sessionId, socketId) {
     // Gerencia eventos de mensagens
     sock.ev.on('messages.upsert', data => {
         console.log('Nova(s) mensagem(ns) recebida(s)');
-        io.to(socketId).emit('messages', data);
+        
+        // Armazena mensagens recentes para polling HTTP
+        if (!recentMessages[sessionId]) {
+            recentMessages[sessionId] = [];
+        }
+        
+        // Adiciona apenas mensagens não enviadas por nós
+        if (data.messages && Array.isArray(data.messages)) {
+            const newMessages = data.messages.filter(msg => msg.key && !msg.key.fromMe);
+            if (newMessages.length > 0) {
+                recentMessages[sessionId].push(...newMessages);
+                
+                // Limitar a 50 mensagens armazenadas
+                if (recentMessages[sessionId].length > 50) {
+                    recentMessages[sessionId] = recentMessages[sessionId].slice(-50);
+                }
+            }
+        }
+        
+        // Também envia via Socket.io se disponível
+        if (socketId) {
+            io.to(socketId).emit('messages', data);
+        }
     });
     
     // Armazena a conexão
@@ -121,15 +167,95 @@ async function startWhatsAppConnection(sessionId, socketId) {
     return sock;
 }
 
-// Rotas da API
+// ROTAS HTTP PARA API REST
+
+// Rota para verificar status de uma sessão
 app.get('/api/status/:sessionId', (req, res) => {
     const { sessionId } = req.params;
     const connection = connections[sessionId];
     
     if (connection) {
-        res.json({ connected: true });
+        res.json({ 
+            connected: true,
+            user: connection.user || { id: 'unknown' }
+        });
     } else {
         res.json({ connected: false });
+    }
+});
+
+// Rota para iniciar uma sessão e gerar QR code
+app.post('/api/start-session/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    
+    try {
+        // Verifica se já existe uma sessão ativa
+        if (connections[sessionId]) {
+            return res.json({ 
+                connected: true, 
+                message: 'Sessão já está ativa' 
+            });
+        }
+        
+        // Inicia nova conexão
+        await startWhatsAppConnection(sessionId);
+        
+        // Aguarda pelo QR code ser gerado (no máximo 5 segundos)
+        let attempts = 0;
+        const checkQR = setInterval(() => {
+            if (qrCodes[sessionId]) {
+                clearInterval(checkQR);
+                res.json({ qrCode: qrCodes[sessionId] });
+            } else if (attempts >= 10) {
+                clearInterval(checkQR);
+                res.status(408).json({ 
+                    error: 'Tempo esgotado ao esperar pelo QR code',
+                    connected: false
+                });
+            }
+            attempts++;
+        }, 500);
+    } catch (error) {
+        console.error('Erro ao iniciar sessão:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Rota para obter mensagens recentes
+app.get('/api/messages/:sessionId', (req, res) => {
+    const { sessionId } = req.params;
+    
+    if (!connections[sessionId]) {
+        return res.status(404).json({ error: 'Sessão não encontrada' });
+    }
+    
+    // Retorna mensagens recentes e limpa a fila
+    const messages = recentMessages[sessionId] || [];
+    recentMessages[sessionId] = [];
+    
+    res.json({ messages });
+});
+
+// Rota para desconectar uma sessão
+app.post('/api/disconnect/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    
+    if (!connections[sessionId]) {
+        return res.json({ success: true, message: 'Sessão já está desconectada' });
+    }
+    
+    try {
+        const sock = connections[sessionId];
+        await sock.logout();
+        
+        delete connections[sessionId];
+        delete qrCodes[sessionId];
+        delete recentMessages[sessionId];
+        
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Erro ao desconectar:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -155,7 +281,7 @@ app.post('/api/send-message/:sessionId', async (req, res) => {
     }
 });
 
-// Conexões WebSocket
+// Conexões WebSocket (mantidas para compatibilidade)
 io.on('connection', (socket) => {
     console.log('Cliente conectado:', socket.id);
     

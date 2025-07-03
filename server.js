@@ -22,12 +22,22 @@ const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
         origin: '*',
-        methods: ['GET', 'POST']
-    }
+        methods: ['GET', 'POST'],
+        allowedHeaders: ['*'],
+        credentials: true
+    },
+    transports: ['polling', 'websocket'], // Prioriza polling sobre WebSockets
+    allowUpgrades: false, // Impede upgrade para WebSockets
+    pingTimeout: 30000,
+    pingInterval: 25000
 });
 
 // Middleware
-app.use(cors());
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type']
+}));
 app.use(express.json());
 
 // Rota de verificação de saúde
@@ -169,7 +179,7 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Servidor rodando na porta ${PORT}`);
-});
+}); 
 
 // Exportar para Vercel
 module.exports = app; 
